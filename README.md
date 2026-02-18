@@ -43,9 +43,9 @@ Otherwise, select smallset.
 ## Building a Cell-Type–Specific Model to Capture Rare Regulatory Variants
 
 To incorporate cell-type–specific regulatory information (e.g., ABC/E2G annotations from https://e2g.stanford.edu/):
-1. `Download the relevant ABC/E2G annotation files.
-2. `Organize all annotation files into a single directory.
-3. `Update the annotation paths in the script: modified_scripts/generate_annotations_ABC (see line 359 in the repository).
+1. Download the relevant ABC/E2G annotation files.
+2. Organize all annotation files into a single directory.
+3. Update the annotation paths in the script: modified_scripts/generate_annotations_ABC (see line 359 in the repository).
 
 **Note** 
 - Annotations must be generated separately for each cell type of interest.
@@ -58,12 +58,12 @@ To run the full workflow, execute the following from the directory containing th
 ./WS_wrapper/driver_Watershed.sh 
 
 Before execution, edit the shell script to specify:
-1. `Input/output paths
-2. `Dataset-specific parameters
-3. `Any objective-specific configurations
+1. Input/output paths
+2. Dataset-specific parameters
+3. Any objective-specific configurations
 
 This script runs the complete pipeline, including:
-1. `Annotation generation
-2. `Multi-omic data integration
-3. `Watershed (WS) model training and evaluation
-4. `Performance assessment and result visualization
+1. Annotation generation
+2. Multi-omic data integration
+3. Watershed (WS) model training and evaluation
+4. Performance assessment and result visualization
