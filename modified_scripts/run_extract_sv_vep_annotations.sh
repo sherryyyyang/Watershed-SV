@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+
+set -o errexit -o nounset -o pipefail
+
+vep_in=$1
+cache_dir=$2
+tmp=$3
+vep_out=$4
+
+echo 'in my dir'
+
+sort -k1,1 -k2,2n ${vep_in} | vep \
+-o ${tmp} \
+--format ensembl \
+--verbose \
+--cache \
+--dir ${cache_dir} \
+--tab \
+--fields "Uploaded_variation,Gene,Feature_type,Consequence,IMPACT" \
+--fork 4 \
+--force \
+--regulatory \
+--overlaps \
+--distance 100000 \
+--cache_version 109 \
+--offline
+
+echo 'extract vep'
+extract_sv_vep_annotations ${tmp} ${vep_out}

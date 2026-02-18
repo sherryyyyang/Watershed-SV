@@ -1,0 +1,1300 @@
+#!/usr/bin/env python3
+
+from pysam import VariantFile
+from sv_utils import *
+import pandas as pd
+import polars as pl
+import polars.selectors as cs
+import functools
+import os
+import numpy as np
+import argparse
+import glob
+import scipy.stats as stats
+
+
+def extract_MAF(vcf_path, field):
+    additional_SV_info = []
+    vcf_read = VariantFile(vcf_path, "r")
+    for rec in vcf_read.fetch():
+        additional_SV_info.append([rec.id, rec.info[field]])
+    return pd.DataFrame(additional_SV_info, columns=["SV", field])
+
+
+def extract_length(vcf_path, field="SVLEN"):
+    additional_SV_info = []
+    vcf_read = VariantFile(vcf_path, "r")
+    for rec in vcf_read.fetch():
+        if rec.info["SVTYPE"] != "BND":
+            if rec.info["SVTYPE"] == "LINE1":
+                if isinstance(rec.info["SVLEN"], int):
+                    if rec.info["SVLEN"] != -1:
+                        additional_SV_info.append([rec.id, abs(int(rec.info["SVLEN"]))])
+                    else:
+                        additional_SV_info.append(
+                            [rec.id, abs(int(rec.info["MEINFO"][2]))]
+                        )
+                else:
+                    if rec.info["SVLEN"][0] != -1:
+                        additional_SV_info.append(
+                            [rec.id, abs(int(rec.info["SVLEN"][0]))]
+                        )
+                    else:
+                        additional_SV_info.append(
+                            [rec.id, abs(int(rec.info["MEINFO"][2]))]
+                        )
+            elif rec.info["SVTYPE"] == "MEI":
+                if isinstance(rec.info["SVLEN"], int):
+                    additional_SV_info.append([rec.id, abs(int(rec.info["SVLEN"]))])
+                else:
+                    additional_SV_info.append([rec.id, abs(int(rec.info["SVLEN"][0]))])
+            elif rec.info["SVTYPE"] == "SVA":
+                if isinstance(rec.info["SVLEN"], int):
+                    svlen = abs(int(rec.info["SVLEN"]))
+                    additional_SV_info.append([rec.id, abs(int(rec.info["SVLEN"]))])
+                else:
+                    svlen = abs(int(rec.info["SVLEN"][0]))
+                    additional_SV_info.append([rec.id, abs(int(rec.info["SVLEN"][0]))])
+            elif rec.info["SVTYPE"] == "ALU":
+                if isinstance(rec.info["SVLEN"], int):
+                    additional_SV_info.append([rec.id, abs(int(rec.info["SVLEN"]))])
+                else:
+                    additional_SV_info.append([rec.id, abs(int(rec.info["SVLEN"][0]))])
+            elif rec.info["SVTYPE"] == "BND":
+                additional_SV_info.append([rec.id, -1])
+            elif "CNV" in rec.info["SVTYPE"]:
+                if "SVLEN" in rec.info:
+                    if isinstance(rec.info["SVLEN"], int):
+                        additional_SV_info.append(
+                            [rec.id + ".DUP_CNV", abs(int(rec.info["SVLEN"]))]
+                        )
+                        additional_SV_info.append(
+                            [rec.id + ".DEL_CNV", abs(int(rec.info["SVLEN"]))]
+                        )
+                    else:
+                        additional_SV_info.append(
+                            [rec.id + ".DUP_CNV", abs(int(rec.info["SVLEN"][0]))]
+                        )
+                        additional_SV_info.append(
+                            [rec.id + ".DEL_CNV", abs(int(rec.info["SVLEN"][0]))]
+                        )
+                else:
+                    additional_SV_info.append(
+                        [rec.id + ".DUP_CNV", abs(rec.stop - rec.pos)]
+                    )
+                    additional_SV_info.append(
+                        [rec.id + ".DEL_CNV", abs(rec.stop - rec.pos)]
+                    )
+            elif rec.info["SVTYPE"] == "DEL":
+                if isinstance(rec.info["SVLEN"], int):
+                    additional_SV_info.append([rec.id, abs(int(rec.info["SVLEN"]))])
+                else:
+                    additional_SV_info.append([rec.id, abs(int(rec.info["SVLEN"][0]))])
+            else:
+                if isinstance(rec.info["SVLEN"], int):
+                    additional_SV_info.append([rec.id, abs(int(rec.info["SVLEN"]))])
+                else:
+                    additional_SV_info.append([rec.id, abs(int(rec.info["SVLEN"][0]))])
+
+    return pd.DataFrame(additional_SV_info, columns=["SV", field])
+
+
+def ensure_lazy_frame(data):
+    """Ensure the input is a Polars lazy frame."""
+    if isinstance(data, pl.DataFrame):
+        return data.lazy()
+    elif isinstance(data, pl.LazyFrame):
+        return data
+    else:
+        raise ValueError("Input must be a Polars DataFrame or LazyFrame.")
+
+
+def standardize_column_names(df):
+    """Standardize column names to ensure consistency and strip gene_id version."""
+    df = df.rename(
+        {col: col.lower().replace(" ", "_").replace("-", "_") for col in df.columns}
+    )
+    if "gene_id" in df.columns:
+        # Strip version from gene_id (keep only before first dot)
+        df = df.with_columns(
+            pl.col("gene_id").str.split(".").list.first().alias("gene_id")
+        )
+    return df
+
+
+def read_and_standardize(
+    file_name, column_mapping=None, annotation_dir=None, flank=None, suffix="", **kwargs
+):
+    """Read a file into a Polars lazy frame, determine subdirectory and suffix dynamically, and standardize column names."""
+    schema_overrides = kwargs.pop("schema_overrides", {})
+
+    # Determine subdirectory and suffix if annotation_dir and flank are provided
+    if annotation_dir and flank:
+        genebody_dir = os.path.join(annotation_dir, "intermediates")
+        tssFlank_dir = os.path.join(annotation_dir, "intermediates_tss_flank")
+        tesFlank_dir = os.path.join(annotation_dir, "intermediates_tes_flank")
+
+        if f"gene_sv_slop.{flank}.bed" in file_name:
+            subdirectory, suffix = genebody_dir, "_slop"
+        elif f"gene_sv.{flank}.bed" in file_name:
+            raise ValueError(
+                "Ambiguous file name. Explicitly specify the subdirectory."
+            )
+        else:
+            raise ValueError(f"Unknown file name pattern: {file_name}")
+        file_path = os.path.join(subdirectory, file_name)
+    else:
+        file_path = file_name
+
+    # Read the file and standardize column names
+
+    df = ensure_lazy_frame(
+        pl.scan_csv(file_path, schema_overrides=schema_overrides, **kwargs)
+    )
+    df = standardize_column_names(df)
+    if column_mapping:
+        actual_mapping = {
+            k: v for k, v in column_mapping.items() if k in df.collect_schema().names()
+        }
+        df = df.rename(actual_mapping)
+    if suffix:
+        df = df.select(
+            [
+                pl.col(["gene_id", "sv"]),
+                pl.all().exclude(["gene_id", "sv"]).name.suffix(suffix),
+            ]
+        )
+    return df
+
+
+def process_annotations(annotation_files, suffix):
+    """Process annotation files and merge them with a suffix."""
+    annotations = [
+        ensure_lazy_frame(
+            pl.scan_csv(file, separator="\t", schema_overrides={"sv": str})
+        )
+        for file in annotation_files
+    ]
+    merged_annotations = annotations[0]
+    for annot in annotations[1:]:
+        merged_annotations = merged_annotations.join(
+            annot, how="full", on=["gene_id", "sv"], coalesce=True
+        )
+    return merged_annotations.select(
+        [
+            pl.col(["gene_id", "sv"]),
+            pl.all().exclude(["gene_id", "sv"]).name.suffix(suffix),
+        ]
+    )
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(
+        description="tools to clean up, impute watershed input"
+    )
+    parser.add_argument(
+        "--vcf",
+        type=str,
+        required=True,
+        metavar="[input SV VCF file]",
+        help="select [SV].vcf to parse",
+    )
+    parser.add_argument(
+        "--genotypes",
+        type=str,
+        required=True,
+        metavar="[input genotype file]",
+        help="select [SV].genotype to parse, output of annotation pipeline",
+    )
+    parser.add_argument(
+        "--genes",
+        type=str,
+        required=True,
+        metavar="[input gene list file]",
+        help="select genes to parse, output of annotation pipeline or custom",
+    )
+    parser.add_argument(
+        "--gene-sv",
+        type=str,
+        required=True,
+        metavar="[input sv-gene pair file]",
+        help="select sv gene pairs to parse, output of annotation pipeline",
+    )
+    parser.add_argument(
+        "--collapse-annotation-instruction",
+        type=str,
+        required=True,
+        metavar="[file with instructions on how to collapse gene level annotations]",
+        help="Collapse gene-sv annotations to gene level annotations, this file provides the instructions",
+    )
+    parser.add_argument(
+        "--annotation-dir",
+        type=str,
+        required=True,
+        metavar="[where the annotations are generater]",
+        help="directory name of annotations",
+    )
+    parser.add_argument(
+        "--outfile",
+        type=str,
+        required=True,
+        metavar="[where to output annotation]",
+        help="where to output merged annotation tsv",
+    )
+    parser.add_argument(
+        "--expressions",
+        type=str,
+        required=True,
+        metavar="[input gene expression file]",
+        help="select gene expression file to parse. This does not come from annotation pipeline",
+    )
+    parser.add_argument(
+        "--expression-field",
+        type=str,
+        required=True,
+        metavar="[column name/prefix of zscores]",
+        help="select gene expression column to parse, it could be the PREFIX of columns, like TE_pvalues_Blood, TE_pvalues_Muscle...",
+    )
+    parser.add_argument(
+        "--expression-id-field",
+        type=str,
+        required=True,
+        metavar="[column name of each sample]",
+        help="select sample column to parse",
+    )
+    parser.add_argument(
+        "--maf-mode",
+        required=True,
+        choices=["upload", "extract"],
+        metavar="[choose how to get MAF]",
+        help="either upload custom MAF SV->MAF tsv, or extract from info from vcf",
+    )
+    parser.add_argument(
+        "--maf-file",
+        default="None",
+        type=str,
+        metavar="[if --maf-mode upload, give file name]",
+        help="name of tsv with SVid from vcf, and a maf column",
+    )
+    parser.add_argument(
+        "--maf-field",
+        default="Max_AF",
+        type=str,
+        metavar="[if --maf-mode extract, give field name]",
+        help="name of info field from vcf. default follows SVAFotate.",
+    )
+    parser.add_argument(
+        "--length-mode",
+        required=True,
+        choices=["upload-SV", "upload-VNTR", "extract"],
+        metavar="[choose how to get length]",
+        help="either upload custom MAF SV->length tsv, or extract from info from vcf",
+    )
+    parser.add_argument(
+        "--length-file",
+        default="None",
+        type=str,
+        metavar="[if --length-mode upload, give file name]",
+        help="name of tsv with SVid from vcf, and a length column",
+    )
+    parser.add_argument(
+        "--length-field",
+        default="SVLEN",
+        type=str,
+        metavar="[if --length-mode extract, give field name]",
+        help="name of info field from vcf. default follows vcf 4.2.",
+    )
+    parser.add_argument(
+        "--CN-mode",
+        required=True,
+        choices=["upload", "extract"],
+        metavar="[choose how to get CN]",
+        help="either upload custom MAF SV->CN tsv, or extract from info from vcf",
+    )
+    parser.add_argument(
+        "--CN-file",
+        default="None",
+        type=str,
+        metavar="[if --CN-mode upload, give file name]",
+        help="name of tsv with SVid, sample id from vcf, and a CN column",
+    )
+    parser.add_argument(
+        "--collapse-mode",
+        required=True,
+        choices=["gene", "gene-sv"],
+        metavar="[choose whether collapse to gene level]",
+        help="either collapse rare SV nearby gene, or evaluate as per gene per sv. ",
+    )
+    parser.add_argument(
+        "--remove-control-genes",
+        action=argparse.BooleanOptionalAction,
+        metavar="[--remove-control-genes|--no-remove-control-genes]",
+        help="remove genes with no outliers or not",
+    )
+    parser.add_argument(
+        "--filter-rare",
+        action=argparse.BooleanOptionalAction,
+        metavar="[--filter-rare|--no-filter-rare]",
+        help="remove not rare sv or not",
+    )
+    parser.add_argument(
+        "--flank",
+        type=int,
+        required=True,
+        metavar="[input flank dist]",
+        help="select flank dist to parse, note only tested to 100kb, performance not guaranteed beyond 100kb with default annotation pipeline",
+    )
+    parser.add_argument(
+        "--zscore-threshold",
+        type=float,
+        required=False,
+        default=3,
+        metavar="[outlier threshold for gene inclusions]",
+        help="select z-score threhsold for selecting genes to include (if we are filtering out genes with no outliers at all. )",
+    )
+    parser.add_argument(
+        "--minimum-support-tissue-count",
+        type=int,
+        required=False,
+        default=5,
+        metavar="[number of outlier signals required to be considered in study]",
+        help="if number of tissues with observed expression for given gene < this number, exclude from study.",
+    )
+    parser.add_argument(
+        "--modalities",
+        type=str,
+        required=True,
+        metavar="[comma-separated modalities]",
+        help="Comma-separated list of modalities (e.g., te,se,ase,apa)",
+    )
+
+    args = parser.parse_args()
+    modalities = args.modalities.split(",")
+    expression_fields = args.expression_field.split(
+        ","
+    )  # e.g., ["ase_zscore", "te_zscore", "se_zscore"]
+    # Dynamically map modalities to their corresponding column names using column_mapping
+
+    # Standardize column names for consistency
+    column_mapping = {
+        "gene": "gene_id",
+        "Gene": "gene_id",
+        "SUBJID": "subjectid",
+        "subjid": "subjectid",
+        "ID": "subjectid",
+        "id": "subjectid",
+        **{f"{mod}_zscore": f"{mod}_pvalue" for mod in modalities},
+    }
+
+    modality_to_field = {
+        mod: column_mapping.get(f"{mod}_zscore", f"{mod}_pvalue") for mod in modalities
+    }
+
+    # Read and standardize input files (only once per file)
+    genotypes = read_and_standardize(
+        args.genotypes,
+        column_mapping=column_mapping,
+        separator="\t",
+        has_header=True,
+        schema_overrides={"sv": str},
+    )
+    if "literal" in genotypes.collect_schema().names():
+        genotypes = genotypes.select(
+            [col for col in genotypes.collect_schema().names() if col != "literal"]
+        )
+
+    gene_sv = read_and_standardize(
+        args.gene_sv,
+        column_mapping=column_mapping,
+        separator="\t",
+        has_header=False,
+        new_columns=["chrom", "start", "end", "sv", "svtype", "gene_id"],
+        schema_overrides={"sv": str},
+    )
+    gene_sv = gene_sv.with_columns(
+        pl.col("gene_id").str.split(".").list.first().alias("gene_id")
+    )
+
+    expression_df = read_and_standardize(
+        args.expressions,
+        column_mapping=column_mapping,
+        separator="\t",
+        has_header=True,
+        null_values="NA",
+        schema_overrides={field: pl.Float64 for field in expression_fields},
+    )
+
+    def clean_expression_data(expression_df, modalities):
+        """Clean and preprocess the expression data."""
+        # Clean gene_id and subjectid, and ensure modality columns are Float64
+        expression_df = expression_df.with_columns(
+            [
+                pl.col("gene_id").str.split(".").list.first().alias("gene_id"),
+                pl.col("subjectid").cast(pl.Utf8),
+            ]
+            + [pl.col(f"{modality}_pvalue").cast(pl.Float64) for modality in modalities]
+        )
+        return expression_df
+
+    # Call the function
+    expression_df = clean_expression_data(expression_df, modalities)
+    # Debug: Check for duplicates in expression_df after reading and cleaning
+    print(
+        "DEBUG: expression_df columns after cleaning:",
+        expression_df.collect_schema().names(),
+    )
+
+    genes = read_and_standardize(
+        args.genes,
+        column_mapping=column_mapping,
+        separator="\t",
+        has_header=False,
+        new_columns=["chrom", "start", "end", "gene_id", "gene_type", "strand"],
+    )
+    genes = genes.with_columns(pl.col("gene_id").str.split(".").list.first())
+
+    genebody_dir = os.path.join(args.annotation_dir, "intermediates")
+    tssFlank_dir = os.path.join(args.annotation_dir, "intermediates_tss_flank")
+    tesFlank_dir = os.path.join(args.annotation_dir, "intermediates_tes_flank")
+
+    gene_sv_slop_df = read_and_standardize(
+        os.path.join(genebody_dir, f"gene_sv_slop.{args.flank}.bed"),
+        column_mapping,
+        suffix="_slop",
+        separator="\t",
+        has_header=False,
+        schema_overrides={"sv": str},
+        new_columns=["chrom", "start", "end", "sv", "svtype", "gene_id"],
+    )
+
+    gene_sv_gb_df = read_and_standardize(
+        os.path.join(genebody_dir, f"gene_sv.{args.flank}.bed"),
+        column_mapping,
+        suffix="_gene_body",
+        separator="\t",
+        has_header=False,
+        schema_overrides={"sv": str},
+        new_columns=["chrom", "start", "end", "sv", "svtype", "gene_id"],
+    )
+
+    gene_sv_tss_df = read_and_standardize(
+        os.path.join(tssFlank_dir, f"gene_sv.{args.flank}.bed"),
+        column_mapping,
+        suffix="_tss_flank",
+        separator="\t",
+        has_header=False,
+        schema_overrides={"sv": str},
+        new_columns=["chrom", "start", "end", "sv", "svtype", "gene_id"],
+    )
+
+    gene_sv_tes_df = read_and_standardize(
+        os.path.join(tesFlank_dir, f"gene_sv.{args.flank}.bed"),
+        column_mapping,
+        suffix="_tes_flank",
+        separator="\t",
+        has_header=False,
+        schema_overrides={"sv": str},
+        new_columns=["chrom", "start", "end", "sv", "svtype", "gene_id"],
+    )
+
+    if args.maf_mode == "extract":
+        maf_frame_pd = extract_MAF(args.vcf, args.maf_field)
+        maf_frame = pl.from_pandas(maf_frame_pd)
+    else:
+        maf_frame_pd = pd.read_csv(
+            args.maf_file, sep="\t", usecols=["SV", "af"], dtype={"SV": str}
+        )
+        maf_frame = pl.from_pandas(maf_frame_pd)
+    maf_frame = standardize_column_names(maf_frame)
+    maf_frame = ensure_lazy_frame(maf_frame)
+
+    if args.length_mode == "extract":
+        length_frame_pd = extract_length(args.vcf, args.length_field)
+    elif args.length_mode == "upload-SV":
+        length_frame_pd = pd.read_csv(
+            args.length_file,
+            sep="\t",
+            names=["sv", "length"],
+            header=0,
+            dtype={"sv": str},
+        )
+    else:
+        length_frame_pd = pd.read_csv(
+            args.length_file,
+            sep="\t",
+            names=["subjectid", "sv", "length"],
+            header=0,
+            dtype={"sv": str},
+        )
+    length_frame = pl.from_pandas(length_frame_pd)
+    length_frame = standardize_column_names(length_frame)
+    length_frame = ensure_lazy_frame(length_frame)
+
+    if "svlen" in length_frame.collect_schema().names():
+        length_frame = length_frame.rename({"svlen": "length"})
+
+    if args.CN_mode == "upload":
+        CN_frame = pl.from_pandas(
+            pd.read_csv(
+                args.CN_file,
+                sep="\t",
+                names=["subjectid", "sv", "dcn"],
+                header=0,
+                dtype={"sv": str},
+            )
+        )
+        CN_frame = standardize_column_names(CN_frame)
+        CN_frame = ensure_lazy_frame(CN_frame)
+
+    genotypes = genotypes.filter(pl.col("svtype") != "BND").with_columns(
+        pl.when(pl.col("svtype") == "VNTR")
+        .then(pl.lit("DUP"))
+        .otherwise(pl.col("svtype"))
+    )
+
+    # Clean gene_id (strip version) before aggregation
+    expression_df_clean = expression_df.with_columns(
+        [pl.col("gene_id").str.split(".").list.first().alias("gene_id")]
+    )
+    print("DEBUG: expression_df_clean", expression_df_clean.collect().head())
+
+    # Aggregate median and count for each modality
+    agg_expressions = []
+    for mod, field in modality_to_field.items():
+        agg_expressions.extend(
+            [
+                pl.col(field).median().alias(f"{mod}_median_outlier"),  # Median outlier
+                pl.col(field).len().alias(f"{mod}_tissue_count"),  # Tissue count
+            ]
+        )
+    print("DEBUG, agg_expressions", agg_expressions)
+    agg_df = expression_df.group_by(["gene_id", "subjectid"]).agg(agg_expressions)
+    print("DEBUG: agg_df columns after aggregation:", agg_df.collect_schema().names())
+    print("DEBUG: agg_df", agg_df.collect().head())
+
+    # Filter for sufficient tissue count for each modality
+    filters = [
+        pl.col(f"{mod}_tissue_count") >= args.minimum_support_tissue_count
+        for mod in modalities
+    ]
+    qualified_expression = agg_df.filter(functools.reduce(lambda x, y: x | y, filters))
+    print(
+        "DEBUG: qualified_expression columns:",
+        qualified_expression.collect_schema().names(),
+    )
+
+    # If you want to filter to only gene_ids present in genes:
+    gene_ids = genes.select("gene_id").collect()["gene_id"].to_list()
+    median_expression_df_protein_coding = qualified_expression.filter(
+        pl.col("gene_id").is_in(gene_ids)
+    )
+
+    # Filter for sufficient tissue count
+    qualified_expression_protein_coding = median_expression_df_protein_coding.filter(
+        functools.reduce(
+            lambda x, y: x | y,
+            [
+                pl.col(f"{mod}_tissue_count") >= args.minimum_support_tissue_count
+                for mod in modalities
+            ],
+        )
+    )
+
+    # Join back to original expression data for all modalities
+    expression_df_combined = qualified_expression.lazy().join(
+        expression_df_clean,
+        on=["gene_id", "subjectid"],
+        how="left",
+        coalesce=True,
+    )
+    print(
+        "DEBUG: expression_df_combined columns after joining:",
+        expression_df_combined.collect_schema().names(),
+    )
+
+    outlier_flags = [
+        pl.when(pl.col(f"{mod}_median_outlier").abs() > args.zscore_threshold)
+        .then(1)
+        .otherwise(0)
+        .alias(f"y_{mod}")
+        for mod in modalities
+    ]
+
+    qualified_expression = agg_df.with_columns(outlier_flags)
+
+    expression_df_combined = expression_df_combined.with_columns(outlier_flags)
+    print("DEBUG: expression_df_combined", expression_df_combined.collect().head())
+
+    expression_df_protein_coding = (
+        qualified_expression_protein_coding.lazy()
+        .join(
+            expression_df_combined.with_columns(
+                [pl.col("gene_id").str.split(".").list.first()]
+            ),
+            how="left",
+            on=["gene_id", "subjectid"],
+            coalesce=True,
+        )
+        .with_columns(
+            [
+                pl.when(
+                    pl.col(f"{mod}_median_outlier").cast(pl.Float64).abs()
+                    > args.zscore_threshold
+                )
+                .then(1)
+                .otherwise(0)
+                .alias(f"y_{mod}")
+                for mod in modalities
+            ]
+        )
+        .drop(
+            [f"{mod}_median_outlier" for mod in modalities]
+            + [f"{mod}_tissue_count" for mod in modalities]
+        )
+    )
+
+    # Filter rare variants (if applicable)
+    if args.filter_rare:
+        rare_maf_frame = maf_frame.filter((pl.col("af") < 0.01) & (pl.col("af") >= 0))
+    else:
+        rare_maf_frame = maf_frame.filter(pl.col("af") >= 0)
+
+    true_rare_alleles = genotypes.filter(pl.col("allele") > 0).join(
+        rare_maf_frame.select("sv"), on="sv", how="inner", coalesce=True
+    )
+
+    print("DEBUG: true_rare_alleles shape:", true_rare_alleles.collect().shape)
+    print("DEBUG: true_rare_alleles sample:", true_rare_alleles.collect().head())
+
+    true_rare_alleles = true_rare_alleles.with_columns(
+        [
+            pl.col("sv").cast(pl.Utf8),
+            pl.col("subjectid").cast(pl.Utf8),
+        ]
+    )
+    gene_sv = gene_sv.with_columns(
+        [
+            pl.col("sv").cast(pl.Utf8),
+            pl.col("gene_id").cast(pl.Utf8),
+        ]
+    )
+
+    print("DEBUG: gene_sv shape:", gene_sv.collect().shape)
+    print("DEBUG: gene_sv sample:", gene_sv.collect().head())
+    expression_df_protein_coding = expression_df_protein_coding.with_columns(
+        [
+            pl.col("gene_id").cast(pl.Utf8),
+            pl.col("subjectid").cast(pl.Utf8),
+        ]
+    )
+
+    # Join with gene_sv and expression data
+    noBND_SV_Ind_Gene = (
+        true_rare_alleles.join(
+            gene_sv.select(["gene_id", "sv"]),
+            on="sv",
+            how="inner",
+            coalesce=True,
+        )
+        .join(
+            expression_df_combined,
+            on=["subjectid", "gene_id"],
+            how="inner",
+            coalesce=True,
+        )
+        .filter(pl.col("svtype") != "BND")
+    )
+    print(
+        "DEBUG: noBND_SV_Ind_Gene columns after joining:",
+        noBND_SV_Ind_Gene.collect_schema().names(),
+    )
+
+    print("DEBUG: noBND_SV_Ind_Gene shape:", noBND_SV_Ind_Gene.collect().shape)
+    print("DEBUG: noBND_SV_Ind_Gene sample:", noBND_SV_Ind_Gene.collect().head())
+
+    if args.remove_control_genes:
+        y_columns = [f"y_{mod}" for mod in modalities] 
+        gene_y_sum = (
+            noBND_SV_Ind_Gene.group_by("gene_id")
+            .agg([pl.col(y_col).sum().alias(f"{y_col}_sum") for y_col in y_columns])
+            .collect()
+        )
+        print("DEBUG: gene_y_sum > 0 counts:")
+        for y_col in y_columns:
+            print(f"{y_col}: {(gene_y_sum[f'{y_col}_sum'] > 0).sum()}")
+            print(f"{y_col} value counts:", gene_y_sum[f"{y_col}_sum"].value_counts())
+
+        filtered_total_data = noBND_SV_Ind_Gene.filter(
+            functools.reduce(
+                lambda x, y: x | y,
+                [pl.col(y_col).sum().over("gene_id") > 0 for y_col in y_columns],
+            )
+        )
+    else:
+        filtered_total_data = noBND_SV_Ind_Gene
+    print(
+        "DEBUG: filtered_total_data columns after filtering:",
+        filtered_total_data.collect_schema().names(),
+    )
+
+    print("DEBUG: filtered_total_data shape:", filtered_total_data.collect().shape)
+    print("DEBUG: filtered_total_data sample:", filtered_total_data.collect().head())
+
+    import glob
+
+    abc_annotations_pattern = os.path.join(
+        args.annotation_dir, "**", f"sv_to_gene_ABC.*.{args.flank}.tsv"
+    )
+    abc_annotations_files = glob.glob(abc_annotations_pattern, recursive=True)
+
+    if not abc_annotations_files:
+        raise FileNotFoundError(
+            f"No ABC annotations file found matching pattern: {abc_annotations_pattern}"
+        )
+
+    abc_annotations_file = abc_annotations_files[0]
+
+    abc_annotations = read_and_standardize(
+        abc_annotations_file,
+        column_mapping=column_mapping,
+        separator="\t",
+        has_header=True,
+    )
+
+    abc_annotations_with_subjects = abc_annotations.collect().join(
+        genotypes.collect().select(["sv", "subjectid"]),
+        on="sv",
+        how="inner",
+        coalesce=True,
+    )
+    abc_annotations_with_subjects_filtered = abc_annotations_with_subjects.filter(
+        pl.col("subjectid").is_not_null()
+    )
+
+    noBND_SV_Ind_Gene_with_ABC = (
+        filtered_total_data.collect()
+        .join(
+            abc_annotations_with_subjects_filtered,
+            left_on=["sv", "gene_id"],
+            right_on=["sv", "gene_id"],
+            how="left",
+            coalesce=True,
+        )
+        .filter(pl.col("subjectid") == pl.col("subjectid"))
+    )
+
+    print("DEBUG: noBND_SV_Ind_Gene_with_ABC shape:", noBND_SV_Ind_Gene_with_ABC.shape)
+    print(
+        "DEBUG: noBND_SV_Ind_Gene_with_ABC sample:", noBND_SV_Ind_Gene_with_ABC.head()
+    )
+
+    genebody_dir = os.path.join(args.annotation_dir, "intermediates")
+    tssFlank_dir = os.path.join(args.annotation_dir, "intermediates_tss_flank")
+    tesFlank_dir = os.path.join(args.annotation_dir, "intermediates_tes_flank")
+
+    annotation_list_gene_body = glob.glob(
+        os.path.join(genebody_dir, f"*.{args.flank}.tsv")
+    )
+    annotation_list_tss_flank = glob.glob(
+        os.path.join(tssFlank_dir, f"*.{args.flank}.tsv")
+    )
+    annotation_list_tes_flank = glob.glob(
+        os.path.join(tesFlank_dir, f"*.{args.flank}.tsv")
+    )
+
+    # sv annotation by regions:
+    svtype_sl = os.path.join(genebody_dir, f"gene_sv_slop.{args.flank}.bed")
+    svtype_gb = os.path.join(genebody_dir, f"gene_sv.{args.flank}.bed")
+    svtype_sf = os.path.join(tssFlank_dir, f"gene_sv.{args.flank}.bed")
+    svtype_ef = os.path.join(tesFlank_dir, f"gene_sv.{args.flank}.bed")
+
+    # Use read_and_standardize to ensure lower-case columns
+    gene_sv_slop_df = (
+        read_and_standardize(
+            svtype_sl,
+            column_mapping=column_mapping,
+            separator="\t",
+            has_header=False,
+            new_columns=["chrom", "start", "end", "sv", "svtype", "gene_id"],
+        )
+        .collect()
+        .to_pandas()
+    )
+    gene_sv_gb_df = (
+        read_and_standardize(
+            svtype_gb,
+            column_mapping=column_mapping,
+            separator="\t",
+            has_header=False,
+            new_columns=["chrom", "start", "end", "sv", "svtype", "gene_id"],
+        )
+        .collect()
+        .to_pandas()
+    )
+    gene_sv_tss_df = (
+        read_and_standardize(
+            svtype_sf,
+            column_mapping=column_mapping,
+            separator="\t",
+            has_header=False,
+            new_columns=["chrom", "start", "end", "sv", "svtype", "gene_id"],
+        )
+        .collect()
+        .to_pandas()
+    )
+    gene_sv_tes_df = (
+        read_and_standardize(
+            svtype_ef,
+            column_mapping=column_mapping,
+            separator="\t",
+            has_header=False,
+            new_columns=["chrom", "start", "end", "sv", "svtype", "gene_id"],
+        )
+        .collect()
+        .to_pandas()
+    )
+
+    # Convert back to polars DataFrame and to_dummies
+    gene_sv_slop_df = pl.from_pandas(gene_sv_slop_df).to_dummies(["svtype"])
+    gene_sv_gb_df = pl.from_pandas(gene_sv_gb_df).to_dummies(["svtype"])
+    gene_sv_tss_df = pl.from_pandas(gene_sv_tss_df).to_dummies(["svtype"])
+    gene_sv_tes_df = pl.from_pandas(gene_sv_tes_df).to_dummies(["svtype"])
+
+    gene_sv_annotation_w_region = (
+        gene_sv_slop_df.lazy()
+        .join(
+            gene_sv_gb_df.lazy().select(["gene_id", "sv", cs.starts_with("svtype_")]),
+            on=["gene_id", "sv"],
+            suffix="_gene_body",
+            how="left",
+            coalesce=True,
+        )
+        .join(
+            gene_sv_tss_df.lazy().select(["gene_id", "sv", cs.starts_with("svtype_")]),
+            on=["gene_id", "sv"],
+            suffix="_tss_flank",
+            how="left",
+            coalesce=True,
+        )
+        .join(
+            gene_sv_tes_df.lazy().select(["gene_id", "sv", cs.starts_with("svtype_")]),
+            on=["gene_id", "sv"],
+            suffix="_tes_flank",
+            how="left",
+            coalesce=True,
+        )
+        .select((~cs.ends_with("_CNV", "_DEL", "_DUP", "_INS", "_INV")))
+        .select(pl.exclude(["chrom", "start", "end"]))
+    )
+
+    # Print column names before lowercasing
+    colnames_before = gene_sv_annotation_w_region.collect_schema().names()
+
+    # Properly lowercase all column names using .rename()
+    gene_sv_annotation_w_region = gene_sv_annotation_w_region.rename(
+        {col: col.lower() for col in colnames_before}
+    )
+
+    annots_gene_body = []
+    for annot_file_gene_body in annotation_list_gene_body:
+        annots_gene_body.append(
+            read_and_standardize(
+                annot_file_gene_body,
+                column_mapping=column_mapping,
+                separator="\t",
+                has_header=True,
+            ).with_columns(
+                pl.col("gene_id").str.split(".").list.first().alias("gene_id")
+            )
+        )
+    merged_annotations_gene_body = annots_gene_body[0]
+    for i in range(1, len(annots_gene_body)):
+        merged_annotations_gene_body = merged_annotations_gene_body.join(
+            annots_gene_body[i], how="full", on=["gene_id", "sv"], coalesce=True
+        )
+    uncollapsed_annotations_gene_body = merged_annotations_gene_body
+
+    annots_tss_flank = []
+    for annot_file_tss_flank in annotation_list_tss_flank:
+        annots_tss_flank.append(
+            read_and_standardize(
+                annot_file_tss_flank,
+                column_mapping=column_mapping,
+                separator="\t",
+                has_header=True,
+            ).with_columns(
+                pl.col("gene_id").str.split(".").list.first().alias("gene_id")
+            )
+        )
+    merged_annotations_tss_flank = annots_tss_flank[0]
+    for i in range(1, len(annots_tss_flank)):
+        merged_annotations_tss_flank = merged_annotations_tss_flank.join(
+            annots_tss_flank[i], how="full", on=["gene_id", "sv"], coalesce=True
+        )
+    uncollapsed_annotations_tss_flank = merged_annotations_tss_flank
+
+    annots_tes_flank = []
+    for annot_file_tes_flank in annotation_list_tes_flank:
+        annots_tes_flank.append(
+            read_and_standardize(
+                annot_file_tes_flank,
+                column_mapping=column_mapping,
+                separator="\t",
+                has_header=True,
+            ).with_columns(
+                pl.col("gene_id").str.split(".").list.first().alias("gene_id")
+            )
+        )
+    merged_annotations_tes_flank = annots_tes_flank[0]
+    for i in range(1, len(annots_tes_flank)):
+        merged_annotations_tes_flank = merged_annotations_tes_flank.join(
+            annots_tes_flank[i], how="full", on=["gene_id", "sv"], coalesce=True
+        )
+    uncollapsed_annotations_tes_flank = merged_annotations_tes_flank
+
+    def add_region_suffix(df, region_suffix, exclude_cols=("gene_id", "sv")):
+        # Use .collect_schema().names() for LazyFrame
+        colnames = (
+            df.collect_schema().names() if isinstance(df, pl.LazyFrame) else df.columns
+        )
+        rename_dict = {
+            col: f"{col}{region_suffix}" for col in colnames if col not in exclude_cols
+        }
+        return df.rename(rename_dict)
+
+    uncollapsed_annotations_gene_body = add_region_suffix(
+        uncollapsed_annotations_gene_body, "_gene_body"
+    )
+    uncollapsed_annotations_tss_flank = add_region_suffix(
+        uncollapsed_annotations_tss_flank, "_tss_flank"
+    )
+    uncollapsed_annotations_tes_flank = add_region_suffix(
+        uncollapsed_annotations_tes_flank, "_tes_flank"
+    )
+
+    # After merging all tes_flank annotations
+    merged_annotations_tes_flank = merged_annotations_tes_flank.with_columns(
+        pl.col("gene_id").str.split(".").list.first().alias("gene_id")
+    )
+
+    # Check for columns that are completely null
+    merged_df = merged_annotations_tes_flank.collect()
+    null_cols = [col for col in merged_df.columns if merged_df[col].is_null().all()]
+
+    filtered_total_data.collect().write_csv(
+        "test_filter_total_data.tsv", separator="\t", include_header=True
+    )
+
+    annotation_cols = set()
+    for annot in [
+        uncollapsed_annotations_gene_body,
+        uncollapsed_annotations_tss_flank,
+        uncollapsed_annotations_tes_flank,
+    ]:
+        annot_colnames = (
+            annot.collect_schema().names()
+            if isinstance(annot, pl.LazyFrame)
+            else annot.columns
+        )
+        annotation_cols.update(
+            [col for col in annot_colnames if col not in ("sv", "gene_id")]
+        )
+    gene_sv_colnames = gene_sv_annotation_w_region.collect_schema().names()
+    cols_to_keep = [
+        col
+        for col in gene_sv_colnames
+        if col not in annotation_cols or col in ("sv", "gene_id")
+    ]
+    gene_sv_annotation_w_region = gene_sv_annotation_w_region.select(cols_to_keep)
+
+    uncollapsed_dataset = (
+        filtered_total_data.lazy()
+        .join(
+            uncollapsed_annotations_gene_body,
+            on=["sv", "gene_id"],
+            how="left",
+            coalesce=True,
+        )
+        .join(
+            uncollapsed_annotations_tss_flank,
+            on=["sv", "gene_id"],
+            how="left",
+            coalesce=True,
+        )
+        .join(
+            uncollapsed_annotations_tes_flank,
+            on=["sv", "gene_id"],
+            how="left",
+            coalesce=True,
+        )
+        .join(
+            gene_sv_annotation_w_region.lazy(),
+            on=["sv", "gene_id"],
+            how="left",
+            coalesce=True,
+        )
+    )
+
+    uncollapsed_dataset_with_MAF = uncollapsed_dataset.join(
+        maf_frame.select(["sv", "af"]), on="sv", how="left", coalesce=True
+    )
+
+    uncollapsed_dataset_with_MAF.collect().write_csv(
+        "test_initial_annotations.tsv", separator="\t", include_header=True
+    )
+    if args.length_mode == "upload-SV" or args.length_mode == "extract":
+        length_frame = length_frame.with_columns(pl.col("length").log())
+        uncollapsed_dataset_with_MAF_length = uncollapsed_dataset_with_MAF.join(
+            length_frame.select(["sv", "length"]), on="sv", how="left", coalesce=True
+        )
+    else:
+        length_frame = length_frame.with_columns(pl.col("length").log())
+        uncollapsed_dataset_with_MAF_length = uncollapsed_dataset_with_MAF.join(
+            length_frame.select(["subjectid", "sv", "length"]),
+            on=["subjectid", "sv"],
+            how="left",
+            coalesce=True,
+        )
+
+    if args.CN_mode == "upload":
+        uncollapsed_dataset_with_MAF_length_CN = (
+            uncollapsed_dataset_with_MAF_length.drop("cn").join(
+                CN_frame.select(["sv", "subjectid", "dcn"]),
+                on=["sv", "subjectid"],
+                how="left",
+                coalesce=True,
+            )
+        )
+        uncollapsed_dataset_with_MAF_length_CN = (
+            uncollapsed_dataset_with_MAF_length_CN.with_columns(
+                pl.col("dcn").fill_null(0)
+            )
+        )
+    else:
+        uncollapsed_dataset_with_MAF_length_CN = uncollapsed_dataset_with_MAF_length
+        uncollapsed_dataset_with_MAF_length_CN = (
+            uncollapsed_dataset_with_MAF_length_CN.with_columns(
+                pl.when((pl.col("cn") == -1) & (pl.col("svtype") == "DUP"))
+                .then(pl.col("allele"))
+                .when((pl.col("cn") == -1) & (pl.col("svtype") == "DEL"))
+                .then(-pl.col("allele"))
+                .when((pl.col("cn") == -1) & (pl.col("svtype") == "INS"))
+                .then(pl.col("allele"))
+                .otherwise(0)
+                .alias("dcn")
+            )
+        )
+    uncollapsed_dataset_with_MAF_length_CN = (
+        uncollapsed_dataset_with_MAF_length_CN.select(pl.exclude("svtype")).collect()
+    )
+
+    seen = set()
+    cols_no_dupes = []
+    for col in uncollapsed_dataset_with_MAF_length_CN.columns:
+        if col not in seen:
+            cols_no_dupes.append(col)
+            seen.add(col)
+    uncollapsed_dataset_with_MAF_length_CN = (
+        uncollapsed_dataset_with_MAF_length_CN.select(cols_no_dupes)
+    )
+
+    print(
+        "DEBUG: uncollapsed_dataset_with_MAF_length_CN_agg columns before collapsing:",
+        uncollapsed_dataset_with_MAF_length_CN.collect_schema().names(),
+    )
+
+    uncollapsed_dataset_with_MAF_length_CN = (
+        uncollapsed_dataset_with_MAF_length_CN.rename(
+            {col: col.lower() for col in uncollapsed_dataset_with_MAF_length_CN.columns}
+        )
+    )
+
+    if args.collapse_mode == "gene-sv":
+        uncollapsed_dataset_with_MAF_length_CN = (
+            uncollapsed_dataset_with_MAF_length_CN.with_columns(
+                pl.concat_str([pl.col("gene_id"), pl.col("sv")], separator=":").alias(
+                    "gene_id"
+                )
+            )
+        )
+
+        uncollapsed_dataset_with_MAF_length_CN_agg = (
+            uncollapsed_dataset_with_MAF_length_CN
+        )
+
+    elif args.collapse_mode == "gene":
+        abc_columns = [
+            col
+            for col in uncollapsed_dataset_with_MAF_length_CN.collect_schema().names()
+            if "_is_abc_sv" in col
+        ]
+        aggregation = [pl.col(col).sum().alias(col) for col in abc_columns]
+
+        agg_df = uncollapsed_dataset_with_MAF_length_CN.group_by(
+            ["subjectid", "gene_id"]
+        ).agg(aggregation)
+
+        uncollapsed_dataset_with_MAF_length_CN_agg = agg_df.join(
+            uncollapsed_dataset_with_MAF_length_CN,
+            on=["subjectid", "gene_id"],
+            how="left",
+            coalesce=True,
+            suffix="_dup",
+        ).drop(
+            [col for col in agg_df.columns if col.endswith("_dup")]
+            + [col for col in agg_df.columns if col.endswith("_tss_flank_dup")]
+            + [col for col in agg_df.columns if col.endswith("_tes_flank_dup")]
+            + [col for col in agg_df.columns if col.endswith("_gene_body_dup")]
+            + [col for col in agg_df.columns if col.endswith("_slop_dup")]
+            + [col for col in agg_df.columns if col.endswith("_dup")]
+        )
+
+    if "te_pvalues" in uncollapsed_dataset_with_MAF_length_CN_agg.columns:
+        uncollapsed_dataset_with_MAF_length_CN_agg = (
+            uncollapsed_dataset_with_MAF_length_CN_agg.drop("te_pvalues")
+        )
+
+    methods = pd.read_csv(args.collapse_annotation_instruction, sep="\t")
+    collapse_records = methods.to_records()
+    collapse_dict = {record[1]: record[3] for record in collapse_records}
+    del collapse_dict["gene_id"]
+    del collapse_dict["subjectid"]
+
+    collapse_modified = {}
+    df_columns_lower = set(
+        uncollapsed_dataset_with_MAF_length_CN_agg.collect_schema().names()
+    )
+    for key, val in collapse_dict.items():
+        key_lower = key.lower()
+        if key_lower in df_columns_lower and key_lower != "dcn":
+            collapse_modified[key_lower] = val
+        elif "pvalue" in key_lower:
+            collapse_modified[key_lower] = "first"
+        elif key_lower == "dcn":
+            collapse_modified["dcn"] = lambda x: x.loc[x.abs().idxmax()]
+
+    for col in df_columns_lower:
+        if "is_abc_sv" in col:
+            collapse_modified[col] = "max"
+        # Add this block to include all te_pvalues columns
+        if "pvalue" in col:
+            collapse_modified[col] = "first"
+
+    y_columns = [f"y_{mod}" for mod in modalities]
+
+    columns = uncollapsed_dataset_with_MAF_length_CN_agg.collect_schema().names()
+    seen = set()
+    unique_columns = [col for col in columns if not (col in seen or seen.add(col))]
+    uncollapsed_dataset_with_MAF_length_CN_agg = (
+        uncollapsed_dataset_with_MAF_length_CN_agg.select(unique_columns)
+    )
+
+    columns = uncollapsed_dataset_with_MAF_length_CN_agg.collect_schema().names()
+    duplicates = [col for col in columns if columns.count(col) > 1]
+    print("DEBUG: Columns before aggregation:", columns)
+    print("DEBUG: Duplicate columns before aggregation:", duplicates)
+
+    df_columns_lower = set(
+        uncollapsed_dataset_with_MAF_length_CN_agg.collect_schema().names()
+    )
+    collapse_modified = {
+        key: val for key, val in collapse_modified.items() if key in df_columns_lower
+    }
+    print("DEBUG: Columns being aggregated:", list(collapse_modified.keys()))
+
+    collapsed_complete_dataset = (
+        uncollapsed_dataset_with_MAF_length_CN_agg.drop(["sv"] + y_columns)
+        .group_by(["subjectid", "gene_id"])
+        .agg(
+            [
+                (
+                    pl.col(col).max().alias(col)
+                    if method == "max"
+                    else (
+                        pl.col(col).min().alias(col)
+                        if method == "min"
+                        else (
+                            pl.when(pl.col(col).is_null().any())
+                            .then(pl.col(col).n_unique() - 1)
+                            .otherwise(pl.col(col).n_unique())
+                            .alias(col)
+                            if method == "nunique"
+                            else (
+                                pl.when(
+                                    col in ["ase_pvalue", "te_pvalue", "se_pvalue", "apa_pvalue"]
+                                )
+                                .then(pl.col(col).first())
+                                .otherwise(pl.col(col).sum())
+                                .alias(col)
+                                if col.endswith("_pvalue")
+                                else (
+                                    pl.col(col).first().alias(col)
+                                    if method == "first"
+                                    else (
+                                        pl.when(
+                                            pl.col(col).max().abs()
+                                            > pl.col(col).min().abs()
+                                        )
+                                        .then(pl.col(col).max())
+                                        .otherwise(pl.col(col).min())
+                                        .alias(col)
+                                        if col == "dcn"
+                                        else (
+                                            pl.col(col).sum().alias(col)
+                                            if "is_abc_sv" in col
+                                            else pl.col(col).max().alias(col)
+                                        )
+                                    )
+                                )
+                            )
+                        )
+                    )
+                )
+                for col, method in collapse_modified.items()
+            ]
+        )
+    )
+
+    collapsed_complete_dataset = collapsed_complete_dataset.with_columns(
+        cs.starts_with("te_pvalue").map_batches(
+            lambda x: stats.norm.sf(abs(x)) * 2 * np.sign(x)
+        )
+    )
+
+    columns = collapsed_complete_dataset.collect_schema().names()
+    seen = set()
+    unique_columns = [col for col in columns if not (col in seen or seen.add(col))]
+    collapsed_complete_dataset = collapsed_complete_dataset.select(unique_columns)
+
+    collapsed_complete_dataset = collapsed_complete_dataset.drop(
+        [
+            col
+            for col in collapsed_complete_dataset.collect_schema().names()
+            if col.endswith("_dup")
+        ]
+    )
+
+    rename_map = {}
+    for col in collapsed_complete_dataset.collect_schema().names():
+        if col.endswith("_gene_body_gene_body"):
+            rename_map[col] = col.replace("_gene_body_gene_body", "_gene_body")
+        elif col.endswith("_tes_flank_tes_flank"):
+            rename_map[col] = col.replace("_tes_flank_tes_flank", "_tes_flank")
+        elif col.endswith("_tss_flank_tss_flank"):
+            rename_map[col] = col.replace("_tss_flank_tss_flank", "_tss_flank")
+    if rename_map:
+        collapsed_complete_dataset = collapsed_complete_dataset.rename(rename_map)
+
+    cols_to_drop = [
+        col
+        for col in collapsed_complete_dataset.collect_schema().names()
+        if col.endswith("_is_abc_sv")
+    ]
+    if cols_to_drop:
+        collapsed_complete_dataset = collapsed_complete_dataset.drop(cols_to_drop)
+    collapsed_complete_dataset.write_csv(args.outfile, separator="\t")
+
+    collapsed_df = collapsed_complete_dataset.to_pandas()
+    null_cols = [
+        col for col in collapsed_df.columns if collapsed_df[col].isnull().all()
+    ]
