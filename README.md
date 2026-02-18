@@ -58,12 +58,12 @@ To run the full workflow, execute the following from the directory containing th
 ./WS_wrapper/driver_Watershed.sh 
 
 Before execution, edit the shell script to specify:
-	•	`Input/output paths
-	•	`Dataset-specific parameters
-	•	`Any objective-specific configurations
+1. `Input/output paths
+2. `Dataset-specific parameters
+3. `Any objective-specific configurations
 
 This script runs the complete pipeline, including:
-	•	`Annotation generation
-	•	`Multi-omic data integration
-	•	`Watershed (WS) model training and evaluation
-	•	`Performance assessment and result visualization
+1. `Annotation generation
+2. `Multi-omic data integration
+3. `Watershed (WS) model training and evaluation
+4. `Performance assessment and result visualization
