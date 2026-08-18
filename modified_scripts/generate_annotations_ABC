@@ -356,7 +356,7 @@ check_file_nonempty ${outdir}/intermediates_tes_flank/remap_crm_sv.dist.${flank}
 echo 'Done extracting gene sv remap overlap'
 
 ## ABC annotations here
-source ~/syang/Watershed-SV/references/E2G_annot/e2g_paths.sh
+source references/E2G_annot/e2g_paths.sh
 
 IFS=',' read -r -a cell_type_list <<< "$cell_type"
 

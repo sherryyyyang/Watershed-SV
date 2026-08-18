@@ -132,8 +132,8 @@ for i in 10; do
     # Visualization checkpoint
     annotation_weight_png="$base_dir/watershed_evaluate_and_visualization/${dataset}_rna_pc_${i}_annotation_weights_model_${model}_dimensions_${number_of_dimensions}.png"
     annotation_weight_done="${annotation_weight_png}.done"
-    if [[ ! -f "$annotation_weight_done_done" ]]; then
-        Rscript $base_dir/watershed_evaluate_and_visualization/watershed_model_weights_rna.R --model_object_rds ${output_prefix_prediction}_prediction_object.rds --combined_annotation_input $input_file --output_file_png "$annotation_weight_png"
+    if [[ ! -f "$annotation_weight_done" ]]; then
+        Rscript $working_dir/watershed_model_weights_rna.R --model_object_rds ${output_prefix_prediction}_prediction_object.rds --combined_annotation_input $input_file --output_file_png "$annotation_weight_png"
         touch "$annotation_weight_done"
     else
         echo "Checkpoint: $visualization_done exists, skipping visualization"
@@ -142,6 +142,6 @@ for i in 10; do
     model_performance_comparison_png="$base_dir/watershed_evaluate_and_visualization/${dataset}_rna_pc_${i}_annotation_weights_model_${model}_dimensions_${number_of_dimensions}.png"
     model_performance_comparison_done="${model_performance_comparison}.done"
     if [[ ! -f "$model_performance_comparison_done" ]]; then
-        Rscript $base_dir/watershed_evaluate_and_visualization/watershed_model_weights_GAM_WS_performance_comparison.R --eval_object_rds ${output_prefix_evaluate}_evalute_object.rds  --output_file_png "$model_performance_comparison_png" 
+        Rscript $working_dir/watershed_model_weights_GAM_WS_performance_comparison.R --eval_object_rds ${output_prefix_evaluate}_evalute_object.rds  --output_file_png "$model_performance_comparison_png" 
     
 done
