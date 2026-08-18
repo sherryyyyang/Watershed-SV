@@ -1,0 +1,36 @@
+# SLURM logs
+slurm_*.out
+slurm_*.err
+*.log
+driver_run_logs/
+
+# Pipeline outputs / intermediates
+generate_annotation/
+run_watershed_combinations/
+watershed_evaluate_and_visualization/
+formatted_data/
+*.done
+
+# Reference / cache data (downloaded, not versioned)
+vep_cache/
+*.tar.gz
+*.gtf.gz
+*.vcf
+*.vcf.gz
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# R
+.Rhistory
+.RData
+.Rproj.user/
+
+# pixi / conda
+.pixi/
+
+# OS
+.DS_Store
